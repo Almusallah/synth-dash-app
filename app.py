@@ -262,16 +262,39 @@ def _decisions(snap: dict) -> str:
     else:
         trades_html = '<div class="panel mut">No closed trades yet.</div>'
 
-    lines = [str(l) for l in snap.get("decisions", []) if l] if isinstance(snap.get("decisions"), list) else []
-    if lines:
+    # health banner: reflects the CURRENT run, so stale errors below never mislead
+    health = snap.get("health") or {}
+    banner = ""
+    if isinstance(health, dict) and health.get("status"):
+        started = esc(health.get("run_started") or "?")
+        errs = health.get("errors_current_run") or 0
+        if health["status"] == "ok" and not errs:
+            banner = (f'<div class="panel" style="margin-top:10px;border-color:#1f7a4d;color:#4ade80">'
+                      f'✓ ENGINE HEALTHY — running clean since {started} UTC, no errors this run. '
+                      f'<span class="mut">(a quiet log is normal: trades are infrequent by design)</span></div>')
+        else:
+            banner = (f'<div class="panel" style="margin-top:10px;border-color:#a15;color:#f87171">'
+                      f'⚠ {errs} error(s) in the current run (since {started} UTC) — check below.</div>')
+
+    raw = snap.get("decisions", [])
+    entries = []  # (text, stale)
+    if isinstance(raw, list):
+        for d in raw:
+            if isinstance(d, dict):
+                if d.get("text"):
+                    entries.append((str(d["text"]), bool(d.get("stale"))))
+            elif d:
+                entries.append((str(d), False))
+    if entries:
         items = "".join(
-            f"<li class='{_decision_cls(l)}'>{esc(_RICH_TAG.sub('', l))}</li>"
-            for l in lines[-60:][::-1]
+            f"<li class='{_decision_cls(t)}{' stale' if stale else ''}'>"
+            f"{'<span class=\"mut\">[previous run] </span>' if stale else ''}{esc(_RICH_TAG.sub('', t))}</li>"
+            for t, stale in entries[-60:][::-1]
         )
         log_html = f'<div class="panel scroll" style="margin-top:10px"><ul class="log">{items}</ul></div>'
     else:
         log_html = '<div class="panel mut" style="margin-top:10px">No decision log lines yet.</div>'
-    return trades_html + log_html
+    return trades_html + banner + log_html
 
 
 def _lessons(snap: dict) -> str:
@@ -392,6 +415,7 @@ ul.lessons{list-style:none}ul.lessons li{padding:5px 0;border-bottom:1px solid v
 ul.lessons li:last-child{border-bottom:none}
 .axis{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-top:6px;gap:8px;flex-wrap:wrap}
 .pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}.amb{color:var(--amb)}.cy{color:var(--cyan)}
+ul.log li.stale{opacity:.42;font-style:italic}
 footer{color:var(--mut);font-size:11px;margin:26px 0 8px;text-align:center}
 """
 

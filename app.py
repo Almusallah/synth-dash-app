@@ -30,8 +30,9 @@ APP_START = time.time()
 app = Flask(__name__)
 
 # snapshot: last pushed payload; series: [[ts, equity], ...] accumulated
-# across pushes (or replaced wholesale if the push carries equity_series).
-_state: dict[str, Any] = {"snapshot": {}, "series": [], "received_at": None}
+# across pushes (or replaced wholesale if the push carries equity_series);
+# coach: last daily brief posted by scripts/coach.py (survives snapshot pushes).
+_state: dict[str, Any] = {"snapshot": {}, "series": [], "received_at": None, "coach": None}
 
 
 # ---------------------------------------------------------------- utilities
@@ -84,6 +85,13 @@ def _pnl_cls(v: float | None) -> str:
     return "pos" if v > 0 else "neg" if v < 0 else "mut"
 
 
+def _authed() -> bool:
+    """Constant-time Bearer check against SYNC_TOKEN (shared by all API routes)."""
+    token = os.environ.get("SYNC_TOKEN", "")
+    supplied = request.headers.get("Authorization", "")
+    return bool(token) and hmac.compare_digest(supplied, f"Bearer {token}")
+
+
 # ------------------------------------------------------------- persistence
 def _load_state() -> None:
     try:
@@ -98,6 +106,7 @@ def _load_state() -> None:
             p for p in (series if isinstance(series, list) else [])
             if isinstance(p, list) and len(p) == 2 and _num(p[1]) is not None
         ][-MAX_SERIES:]
+        _state["coach"] = data["coach"] if isinstance(data.get("coach"), dict) else None
 
 
 def _save_state() -> None:
@@ -112,9 +121,7 @@ def _save_state() -> None:
 # --------------------------------------------------------------- API routes
 @app.post("/api/push")
 def push():
-    token = os.environ.get("SYNC_TOKEN", "")
-    supplied = request.headers.get("Authorization", "")
-    if not token or not hmac.compare_digest(supplied, f"Bearer {token}"):
+    if not _authed():
         return jsonify(error="bad or missing bearer token"), 401
     snap = request.get_json(silent=True)
     if not isinstance(snap, dict):
@@ -143,6 +150,30 @@ def push():
             del _state["series"][:-MAX_SERIES]
     _save_state()
     return jsonify(ok=True, points=len(_state["series"]))
+
+
+@app.get("/api/state")
+def get_state():
+    """Last stored snapshot, for offline consumers (e.g. the daily coach)."""
+    if not _authed():
+        return jsonify(error="bad or missing bearer token"), 401
+    snap = _state.get("snapshot")
+    if not isinstance(snap, dict) or not snap:
+        return jsonify(error="no snapshot stored yet"), 404
+    return jsonify(snap)
+
+
+@app.post("/api/coach")
+def post_coach():
+    """Store the coach's daily brief (rendered on the page, survives pushes)."""
+    if not _authed():
+        return jsonify(error="bad or missing bearer token"), 401
+    brief = request.get_json(silent=True)
+    if not isinstance(brief, dict):
+        return jsonify(error="body must be a JSON object"), 400
+    _state["coach"] = brief
+    _save_state()
+    return jsonify(ok=True)
 
 
 @app.get("/api/health")
@@ -311,6 +342,55 @@ def _lessons(snap: dict) -> str:
     return f'<div class="panel"><ul class="lessons">{items}</ul></div>'
 
 
+_REGIME_CLS = {"trending-up": "pos", "trending-down": "neg", "ranging": "mut", "volatile": "amb"}
+_KIND_CLS = {"observation": "mut", "suggestion": "amb", "action": "cy"}
+
+
+def _coach(coach: Any) -> str:
+    """Render the Coach's Daily Brief; tolerates any missing/malformed field."""
+    if not isinstance(coach, dict) or not coach:
+        return ('<div class="panel mut">No coach brief yet — '
+                'the daily coach posts once per trading day.</div>')
+    headline = esc(coach.get("headline") or "Daily brief")
+    parts = [
+        '<div class="panel">',
+        '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">'
+        f'<b class="cy">{headline}</b>'
+        f'<span class="mut">{_fmt_ts(coach.get("ts"))}</span></div>',
+    ]
+    regimes = _rows(coach.get("market_regime"))
+    if regimes:
+        body = "".join(
+            f"<tr><td>{esc(r.get('symbol', '?'))}</td>"
+            f"<td class='{_REGIME_CLS.get(str(r.get('regime', '')).lower(), 'mut')}'>"
+            f"{esc(r.get('regime', '—'))}</td>"
+            f"<td class='mut'>{esc(r.get('note', ''))}</td></tr>"
+            for r in regimes
+        )
+        parts.append(
+            '<div class="scroll" style="margin-top:10px"><table>'
+            "<tr><th>Symbol</th><th>Regime</th><th>Note</th></tr>"
+            f"{body}</table></div>"
+        )
+    if coach.get("performance_review"):
+        parts.append(f'<p style="margin-top:10px">{esc(coach.get("performance_review"))}</p>')
+    recs = _rows(coach.get("recommendations"))
+    if recs:
+        items = "".join(
+            f"<li><span class='{_KIND_CLS.get(str(r.get('kind', '')).lower(), 'mut')}' "
+            "style='text-transform:uppercase;font-size:10px;letter-spacing:.08em'>"
+            f"{esc(r.get('kind', 'note'))}</span> <b>{esc(r.get('title', ''))}</b>"
+            f"<div class='mut'>{esc(r.get('detail', ''))}</div></li>"
+            for r in recs
+        )
+        parts.append(f'<ul class="coach" style="margin-top:10px">{items}</ul>')
+    if not coach.get("llm"):
+        parts.append('<div class="mut" style="font-size:11px;margin-top:10px">'
+                     "statistical mode — run claude /login on the Mac for full AI analysis</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _scorecard(snap: dict) -> str:
     trades = _rows(snap.get("trades"))
     sc = snap.get("scorecard") if isinstance(snap.get("scorecard"), dict) else {}
@@ -413,6 +493,8 @@ tr:last-child td{border-bottom:none}
 ul.log{list-style:none;font:12px/1.75 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 ul.lessons{list-style:none}ul.lessons li{padding:5px 0;border-bottom:1px solid var(--edge)}
 ul.lessons li:last-child{border-bottom:none}
+ul.coach{list-style:none}ul.coach li{padding:6px 0;border-bottom:1px solid var(--edge)}
+ul.coach li:last-child{border-bottom:none}
 .axis{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-top:6px;gap:8px;flex-wrap:wrap}
 .pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}.amb{color:var(--amb)}.cy{color:var(--cyan)}
 ul.log li.stale{opacity:.42;font-style:italic}
@@ -435,6 +517,7 @@ def index() -> Response:
         + "<h2>Equity Chart</h2>" + _equity_chart(_state["series"])
         + "<h2>Decisions</h2>" + _decisions(snap)
         + "<h2>Lessons Learned</h2>" + _lessons(snap)
+        + "<h2>Coach's Daily Brief</h2>" + _coach(_state.get("coach"))
         + "<h2>Strategy Scorecard</h2>" + _scorecard(snap)
         + "<h2>Ops Panel</h2>" + _ops(snap, received_at)
         + "<footer>synthetic-trader dashboard · state is pushed by the bot's Mac · refresh for latest</footer>"

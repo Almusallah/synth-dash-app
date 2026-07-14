@@ -31,8 +31,10 @@ app = Flask(__name__)
 
 # snapshot: last pushed payload; series: [[ts, equity], ...] accumulated
 # across pushes (or replaced wholesale if the push carries equity_series);
-# coach: last daily brief posted by scripts/coach.py (survives snapshot pushes).
-_state: dict[str, Any] = {"snapshot": {}, "series": [], "received_at": None, "coach": None}
+# coach: last daily brief posted by scripts/coach.py (survives snapshot pushes);
+# medic: last health report posted by scripts/medic.py (survives pushes too).
+_state: dict[str, Any] = {"snapshot": {}, "series": [], "received_at": None,
+                          "coach": None, "medic": None}
 
 
 # ---------------------------------------------------------------- utilities
@@ -114,6 +116,7 @@ def _load_state() -> None:
             if isinstance(p, list) and len(p) == 2 and _num(p[1]) is not None
         ][-MAX_SERIES:]
         _state["coach"] = data["coach"] if isinstance(data.get("coach"), dict) else None
+        _state["medic"] = data["medic"] if isinstance(data.get("medic"), dict) else None
 
 
 def _save_state() -> None:
@@ -179,6 +182,19 @@ def post_coach():
     if not isinstance(brief, dict):
         return jsonify(error="body must be a JSON object"), 400
     _state["coach"] = brief
+    _save_state()
+    return jsonify(ok=True)
+
+
+@app.post("/api/medic")
+def post_medic():
+    """Store the medic's health report (rendered in the Ops Panel, survives pushes)."""
+    if not _authed():
+        return jsonify(error="bad or missing bearer token"), 401
+    report = request.get_json(silent=True)
+    if not isinstance(report, dict):
+        return jsonify(error="body must be a JSON object"), 400
+    _state["medic"] = report
     _save_state()
     return jsonify(ok=True)
 
@@ -437,7 +453,50 @@ def _scorecard(snap: dict) -> str:
     )
 
 
-def _ops(snap: dict, received_at: float | None) -> str:
+_SEV_CLS = {"critical": "neg", "warn": "amb", "info": "mut"}
+_MEDIC_PILL = {"healthy": "pos", "degraded": "amb", "critical": "neg"}
+
+
+def _medic(medic: Any) -> str:
+    """Compact Medic block for the Ops Panel; tolerates any missing field."""
+    if not isinstance(medic, dict) or not medic:
+        return ('<div class="panel mut" style="margin-top:10px">'
+                "Medic: no report yet — scripts/medic.py checks every 30 minutes.</div>")
+    status = str(medic.get("status") or "unknown").lower()
+    pill = _MEDIC_PILL.get(status, "mut")
+    ts = _num(medic.get("ts"))
+    checked = (f"last check {_fmt_ts(ts)} · {_age(time.time() - ts)} ago"
+               if ts else "last check time unknown")
+
+    findings = _rows(medic.get("findings"))
+    if findings:
+        items = "".join(
+            f"<li><b class='{_SEV_CLS.get(str(f.get('severity', '')).lower(), 'mut')}'>"
+            f"{esc(f.get('code', '?'))}</b> "
+            f"<span class='mut'>{esc(str(f.get('detail', ''))[:140])}</span></li>"
+            for f in findings[:8]
+        )
+        findings_html = f"<ul class='medic'>{items}</ul>"
+    else:
+        findings_html = "<div class='mut' style='font-size:12px'>no findings — all checks passed</div>"
+
+    actions = medic.get("actions")
+    action = str(actions[-1]) if isinstance(actions, list) and actions else ""
+    action_html = (f"<div class='mut' style='font-size:12px;margin-top:6px'>"
+                   f"action: {esc(action[:180])}</div>" if action else "")
+    diagnosis = str(medic.get("diagnosis") or "")
+    diag_html = (f"<div class='mut' style='font-size:12px;margin-top:6px'>"
+                 f"diagnosis: {esc(diagnosis[:300])}</div>" if diagnosis else "")
+    return (
+        '<div class="panel" style="margin-top:10px">'
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">'
+        f'<b>Medic</b><span class="pill {pill}">{esc(status)}</span>'
+        f'<span class="mut" style="font-size:11px">{esc(checked)}</span></div>'
+        f'<div style="margin-top:8px">{findings_html}</div>{action_html}{diag_html}</div>'
+    )
+
+
+def _ops(snap: dict, received_at: float | None, medic: Any = None) -> str:
     rows: list[tuple[str, str, str]] = []
 
     expires = str(snap.get("token_expires") or "")
@@ -477,7 +536,7 @@ def _ops(snap: dict, received_at: float | None) -> str:
     body = "".join(
         f"<tr><td class='mut'>{k}</td><td class='{cls}'>{v}</td></tr>" for k, v, cls in rows
     )
-    return f'<div class="panel scroll"><table class="ops">{body}</table></div>'
+    return f'<div class="panel scroll"><table class="ops">{body}</table></div>' + _medic(medic)
 
 
 _CSS = """
@@ -510,6 +569,9 @@ ul.lessons{list-style:none}ul.lessons li{padding:5px 0;border-bottom:1px solid v
 ul.lessons li:last-child{border-bottom:none}
 ul.coach{list-style:none}ul.coach li{padding:6px 0;border-bottom:1px solid var(--edge)}
 ul.coach li:last-child{border-bottom:none}
+ul.medic{list-style:none;font-size:12px}ul.medic li{padding:3px 0}
+.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-size:10.5px;
+font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid currentColor}
 .axis{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-top:6px;gap:8px;flex-wrap:wrap}
 .pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}.amb{color:var(--amb)}.cy{color:var(--cyan)}
 ul.log li.stale{opacity:.42;font-style:italic}
@@ -534,7 +596,7 @@ def index() -> Response:
         + "<h2>Lessons Learned</h2>" + _lessons(snap)
         + "<h2>Coach's Daily Brief</h2>" + _coach(_state.get("coach"))
         + "<h2>Strategy Scorecard</h2>" + _scorecard(snap)
-        + "<h2>Ops Panel</h2>" + _ops(snap, received_at)
+        + "<h2>Ops Panel</h2>" + _ops(snap, received_at, _state.get("medic"))
         + "<footer>synthetic-trader dashboard · state is pushed by the bot's Mac · refresh for latest</footer>"
         "</body></html>"
     )

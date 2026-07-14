@@ -6,6 +6,12 @@ restart reloads the last known state. GET / renders a single dark-theme page
 with zero frontend dependencies: all HTML, CSS and the equity chart (inline
 SVG polyline) are produced server-side. Every section tolerates missing or
 partial snapshot data.
+
+A built-in cloud medic (daemon thread, every 15 minutes) triages the stored
+state 24/7 — no LLM, no external deps — and can trigger ONE rate-limited
+worker restart via env SYNTH_DEPLOY_HOOK. The Mac medic (scripts/medic.py)
+still POSTs richer reports (with LLM diagnosis) to /api/medic; those
+overwrite the cloud report and are labelled source "mac".
 """
 from __future__ import annotations
 
@@ -14,7 +20,10 @@ import html
 import json
 import os
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,9 +41,11 @@ app = Flask(__name__)
 # snapshot: last pushed payload; series: [[ts, equity], ...] accumulated
 # across pushes (or replaced wholesale if the push carries equity_series);
 # coach: last daily brief posted by scripts/coach.py (survives snapshot pushes);
-# medic: last health report posted by scripts/medic.py (survives pushes too).
+# medic: last health report — written by the in-process cloud medic loop and
+# overwritten by scripts/medic.py POSTs (survives pushes too);
+# medic_cloud: cloud medic's restart rate-limiter state (last_restart_ts).
 _state: dict[str, Any] = {"snapshot": {}, "series": [], "received_at": None,
-                          "coach": None, "medic": None}
+                          "coach": None, "medic": None, "medic_cloud": {}}
 
 
 # ---------------------------------------------------------------- utilities
@@ -117,13 +128,19 @@ def _load_state() -> None:
         ][-MAX_SERIES:]
         _state["coach"] = data["coach"] if isinstance(data.get("coach"), dict) else None
         _state["medic"] = data["medic"] if isinstance(data.get("medic"), dict) else None
+        _state["medic_cloud"] = (data["medic_cloud"]
+                                 if isinstance(data.get("medic_cloud"), dict) else {})
+
+
+_SAVE_LOCK = threading.Lock()  # push handler and medic thread both save
 
 
 def _save_state() -> None:
     tmp = STATE_PATH.with_suffix(".json.tmp")
     try:
-        tmp.write_text(json.dumps(_state))
-        tmp.replace(STATE_PATH)
+        with _SAVE_LOCK:
+            tmp.write_text(json.dumps(_state))
+            tmp.replace(STATE_PATH)
     except OSError:
         pass  # disk mirror is best-effort; the in-memory copy still serves
 
@@ -188,12 +205,17 @@ def post_coach():
 
 @app.post("/api/medic")
 def post_medic():
-    """Store the medic's health report (rendered in the Ops Panel, survives pushes)."""
+    """Store the medic's health report (rendered in the Ops Panel, survives pushes).
+
+    Mac medic reports (which carry an LLM diagnosis) overwrite the cloud
+    medic's report; they are tagged source "mac" unless they say otherwise.
+    """
     if not _authed():
         return jsonify(error="bad or missing bearer token"), 401
     report = request.get_json(silent=True)
     if not isinstance(report, dict):
         return jsonify(error="body must be a JSON object"), 400
+    report.setdefault("source", "mac")
     _state["medic"] = report
     _save_state()
     return jsonify(ok=True)
@@ -202,6 +224,272 @@ def post_medic():
 @app.get("/api/health")
 def health():
     return jsonify(ok=True, last_sync=_state["received_at"])
+
+
+# -------------------------------------------------------------- cloud medic
+# Self-contained 24/7 triage loop, ported from scripts/medic.py (the dash
+# deploys standalone — no synth package, no scripts/). A daemon thread wakes
+# every MEDIC_INTERVAL_S and triages the in-memory _state directly: the age
+# of received_at replaces the Mac medic's /api/state fetch, so a fresh dash
+# boot (received_at is None) is reported as DASH_AMNESIA (info, NO restart)
+# instead of a false-positive STALE_SNAPSHOT. Bounded fix: STALE_SNAPSHOT /
+# DISCONNECT_LOOP / RATE_LIMITED POST the Render deploy hook (env
+# SYNTH_DEPLOY_HOOK), hard-limited to 1 restart per 2h, persisted in the
+# state file under "medic_cloud". No LLM in the cloud medic.
+MEDIC_INTERVAL_S = 900
+MEDIC_STALE_AFTER_S = 600
+MEDIC_ANALYST_DEAD_S = 3 * 3600
+MEDIC_TOKEN_CRIT_DAYS = 3
+MEDIC_DISCONNECT_LOOP_MIN = 3
+MEDIC_UNKNOWN_CRIT_MIN = 5
+MEDIC_RESTART_COOLDOWN_S = 2 * 3600
+MEDIC_RESTART_CODES = {"STALE_SNAPSHOT", "DISCONNECT_LOOP", "RATE_LIMITED"}
+
+# (code, severity, min line count to emit) — order = classification priority
+_MEDIC_ENGINE_CODES: tuple[tuple[str, str, int], ...] = (
+    ("ANALYST_FALLBACK", "warn", 1),
+    ("TRENDBAR_FAIL", "warn", 1),
+    ("DISCONNECT_LOOP", "critical", MEDIC_DISCONNECT_LOOP_MIN),
+    ("RATE_LIMITED", "critical", 1),
+    ("ORDER_REJECTED", "warn", 1),
+)
+
+
+def _medic_finding(code: str, severity: str, detail: str,
+                   count: int | None = None) -> dict:
+    f: dict[str, Any] = {"code": code, "severity": severity, "detail": detail}
+    if count is not None:
+        f["count"] = count
+    return f
+
+
+def _medic_run_lines(snap: dict) -> list[str]:
+    """Decision-log lines from the CURRENT engine run (stale ones excluded)."""
+    out: list[str] = []
+    for d in snap.get("decisions") or []:
+        if isinstance(d, dict):
+            if d.get("text") and not d.get("stale"):
+                out.append(str(d["text"]))
+        elif d:
+            out.append(str(d))
+    return out
+
+
+def _medic_classify(line: str) -> str | None:
+    """Map one decision line to an engine-error code (first match wins)."""
+    low = line.lower()
+    if "analyst unavailable" in low:
+        return "ANALYST_FALLBACK"
+    if "trendbars" in low:
+        return "TRENDBAR_FAIL"
+    if "disconnected" in low:
+        return "DISCONNECT_LOOP"
+    if "rate limited" in low or "blocked_payload_type" in low:
+        return "RATE_LIMITED"
+    if "rejected" in low:
+        return "ORDER_REJECTED"
+    if "error" in low:
+        return "UNKNOWN_ERROR"
+    return None
+
+
+def _medic_triage(snap: dict, received_at: float | None, now: float) -> list[dict]:
+    """Deterministic findings over the stored state. Pure: no I/O, no clock —
+    `now` is injected so tests can pin it."""
+    findings: list[dict] = []
+
+    # -- staleness: age of received_at replaces the snapshot fetch ---------
+    if received_at is None:
+        findings.append(_medic_finding(
+            "DASH_AMNESIA", "info",
+            "dashboard restarted and no push received yet — worker state "
+            "unknown; waiting for the next push (no restart on this)"))
+    elif now - received_at > MEDIC_STALE_AFTER_S:
+        findings.append(_medic_finding(
+            "STALE_SNAPSHOT", "critical",
+            f"last push {int(now - received_at)}s ago "
+            f"(limit {MEDIC_STALE_AFTER_S}s) — worker down or stuck"))
+
+    # -- ENGINE_ERRORS: classify the current run's decision lines ----------
+    health_d = snap.get("health") if isinstance(snap.get("health"), dict) else {}
+    errs = int(_num(health_d.get("errors_current_run")) or 0)
+    if errs > 0:
+        counts: dict[str, int] = {}
+        samples: dict[str, str] = {}
+        for line in _medic_run_lines(snap):
+            code = _medic_classify(line)
+            if code:
+                counts[code] = counts.get(code, 0) + 1
+                samples.setdefault(code, line.strip())
+        emitted = False
+        for code, severity, min_n in _MEDIC_ENGINE_CODES:
+            n = counts.get(code, 0)
+            if n >= min_n:
+                findings.append(_medic_finding(
+                    code, severity,
+                    f"{n} line(s) this run, e.g. “{samples[code][:160]}”",
+                    count=n))
+                emitted = True
+        unknown = counts.get("UNKNOWN_ERROR", 0)
+        if unknown or not emitted:
+            n = unknown or errs
+            findings.append(_medic_finding(
+                "UNKNOWN_ERROR",
+                "critical" if n >= MEDIC_UNKNOWN_CRIT_MIN else "warn",
+                (f"{unknown} unclassified error line(s), e.g. "
+                 f"“{samples['UNKNOWN_ERROR'][:160]}”" if unknown else
+                 f"health reports {errs} error(s) this run but no matching "
+                 "decision lines were pushed"),
+                count=n))
+
+    # -- KILL_SWITCH --------------------------------------------------------
+    risk = snap.get("risk") if isinstance(snap.get("risk"), dict) else {}
+    if risk.get("kill_switch"):
+        findings.append(_medic_finding(
+            "KILL_SWITCH", "critical",
+            "kill switch file present — all new entries halted; needs human "
+            "review before re-arming"))
+
+    # -- TOKEN_EXPIRY --------------------------------------------------------
+    expires = str(snap.get("token_expires") or "")
+    days: int | None = None
+    try:
+        days = (datetime.strptime(expires, "%Y-%m-%d").date()
+                - datetime.fromtimestamp(now, tz=timezone.utc).date()).days
+    except ValueError:
+        pass
+    if days is not None:
+        if days < 0:
+            findings.append(_medic_finding(
+                "TOKEN_EXPIRY", "critical",
+                f"cTrader token EXPIRED {-days}d ago ({expires}) — renew now"))
+        elif days < MEDIC_TOKEN_CRIT_DAYS:
+            findings.append(_medic_finding(
+                "TOKEN_EXPIRY", "critical",
+                f"cTrader token expires in {days}d ({expires}) — renew now"))
+        elif days < TOKEN_WARN_DAYS:
+            findings.append(_medic_finding(
+                "TOKEN_EXPIRY", "warn",
+                f"cTrader token expires in {days}d ({expires}) — schedule a renewal"))
+
+    # -- ANALYST_DEAD --------------------------------------------------------
+    analyst = snap.get("analyst") if isinstance(snap.get("analyst"), dict) else {}
+    a_ts = _num(analyst.get("ts"))
+    if (str(analyst.get("notes") or "").lower().startswith("fallback")
+            and a_ts is not None and now - a_ts > MEDIC_ANALYST_DEAD_S):
+        findings.append(_medic_finding(
+            "ANALYST_DEAD", "warn",
+            f"analyst stuck in neutral fallback for {(now - a_ts) / 3600:.1f}h "
+            "— Claude offline on the worker"))
+
+    return findings
+
+
+def _medic_status(findings: list[dict]) -> str:
+    """'healthy' | 'degraded' | 'critical' from the worst finding severity."""
+    severities = {str(f.get("severity")) for f in findings}
+    if "critical" in severities:
+        return "critical"
+    if "warn" in severities:
+        return "degraded"
+    return "healthy"
+
+
+def _medic_restart_reasons(findings: list[dict]) -> list[str]:
+    """Finding codes that justify a worker restart (bounded fix policy).
+    DASH_AMNESIA is deliberately NOT restart-worthy."""
+    return [str(f.get("code")) for f in findings
+            if str(f.get("code")) in MEDIC_RESTART_CODES]
+
+
+def _medic_restart_allowed(medic_cloud: Any, now: float) -> tuple[bool, str]:
+    """Rate limiter: max 1 restart per MEDIC_RESTART_COOLDOWN_S. Pure — the
+    caller persists the state. Returns (allowed, reason-if-blocked)."""
+    last = _num(medic_cloud.get("last_restart_ts")) if isinstance(medic_cloud, dict) else None
+    if last is not None and 0 <= now - last < MEDIC_RESTART_COOLDOWN_S:
+        ago = int((now - last) / 60)
+        left = int((MEDIC_RESTART_COOLDOWN_S - (now - last)) / 60)
+        return False, f"last restart {ago}m ago, cooldown active (~{left}m left)"
+    return True, ""
+
+
+def _post_deploy_hook(hook: str) -> tuple[bool, str]:
+    """POST the Render deploy hook (secret lives in the URL; empty body)."""
+    req = urllib.request.Request(hook, data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return 200 <= resp.status < 300, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _medic_cycle(now: float | None = None) -> dict:
+    """One triage -> (bounded) fix -> report pass over the stored state."""
+    now = time.time() if now is None else now
+    snap = _state["snapshot"] if isinstance(_state["snapshot"], dict) else {}
+    findings = _medic_triage(snap, _state.get("received_at"), now)
+    status = _medic_status(findings)
+
+    actions: list[str] = []
+    reasons = sorted(set(_medic_restart_reasons(findings)))
+    if reasons:
+        reason_txt = ",".join(reasons)
+        hook = os.environ.get("SYNTH_DEPLOY_HOOK", "").strip()
+        if not hook:
+            actions.append("restart needed — env SYNTH_DEPLOY_HOOK not set")
+        else:
+            allowed, why = _medic_restart_allowed(_state.get("medic_cloud"), now)
+            if not allowed:
+                actions.append(f"restart skipped — {why}")
+            else:
+                ok, http_txt = _post_deploy_hook(hook)
+                if ok:
+                    _state["medic_cloud"] = {"last_restart_ts": now,
+                                             "last_restart_reason": reason_txt}
+                    actions.append(f"worker restart triggered via deploy hook "
+                                   f"({http_txt}) — reason: {reason_txt}")
+                else:
+                    actions.append(f"restart attempt FAILED ({http_txt}) "
+                                   f"— reason: {reason_txt}")
+    else:
+        actions.append("no action needed")
+
+    report = {"ts": int(now), "status": status, "findings": findings,
+              "actions": actions, "diagnosis": "—", "source": "cloud"}
+    _state["medic"] = report
+    _save_state()
+    return report
+
+
+def _medic_loop() -> None:
+    """Run forever; a cycle failure must never kill the thread."""
+    while True:
+        try:
+            _medic_cycle()
+        except Exception:
+            pass  # never let the medic thread die
+        time.sleep(MEDIC_INTERVAL_S)
+
+
+_MEDIC_THREAD_LOCK = threading.Lock()
+_medic_thread: threading.Thread | None = None
+
+
+def _start_medic_thread() -> None:
+    """Start the cloud medic once per process (gunicorn -w 1 imports the
+    module once, but guard anyway — reloaders/tests may import twice).
+    Set env SYNTH_MEDIC_LOOP=0 to disable (tests, local dev)."""
+    global _medic_thread
+    if os.environ.get("SYNTH_MEDIC_LOOP", "1") == "0":
+        return
+    with _MEDIC_THREAD_LOCK:
+        if _medic_thread is not None and _medic_thread.is_alive():
+            return
+        _medic_thread = threading.Thread(
+            target=_medic_loop, name="cloud-medic", daemon=True)
+        _medic_thread.start()
 
 
 # ------------------------------------------------------------ page sections
@@ -461,12 +749,14 @@ def _medic(medic: Any) -> str:
     """Compact Medic block for the Ops Panel; tolerates any missing field."""
     if not isinstance(medic, dict) or not medic:
         return ('<div class="panel mut" style="margin-top:10px">'
-                "Medic: no report yet — scripts/medic.py checks every 30 minutes.</div>")
+                "Medic: no report yet — the built-in cloud medic checks every "
+                "15 minutes.</div>")
     status = str(medic.get("status") or "unknown").lower()
     pill = _MEDIC_PILL.get(status, "mut")
+    source = str(medic.get("source") or "mac").lower()
     ts = _num(medic.get("ts"))
-    checked = (f"last check {_fmt_ts(ts)} · {_age(time.time() - ts)} ago"
-               if ts else "last check time unknown")
+    checked = (f"via {source} · last check {_fmt_ts(ts)} · {_age(time.time() - ts)} ago"
+               if ts else f"via {source} · last check time unknown")
 
     findings = _rows(medic.get("findings"))
     if findings:
@@ -604,6 +894,7 @@ def index() -> Response:
 
 
 _load_state()
+_start_medic_thread()  # cloud medic runs 24/7 inside this service
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5077")))

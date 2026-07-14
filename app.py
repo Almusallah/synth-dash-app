@@ -223,7 +223,19 @@ def post_medic():
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, last_sync=_state["received_at"])
+    mc = _state.get("medic_cloud") or {}
+    return jsonify(
+        ok=True,
+        last_sync=_state["received_at"],
+        # cloud-medic liveness — proves the 24/7 triage thread is ticking even
+        # when the Mac medic owns the display. No secrets (deploy hook is not here).
+        medic_cloud={
+            "last_cycle_ts": mc.get("last_cycle_ts"),
+            "last_status": mc.get("last_status"),
+            "last_findings": mc.get("last_findings"),
+            "last_restart_ts": mc.get("last_restart_ts"),
+        },
+    )
 
 
 # -------------------------------------------------------------- cloud medic
@@ -429,6 +441,9 @@ def _medic_cycle(now: float | None = None) -> dict:
     """One triage -> (bounded) fix -> report pass over the stored state."""
     now = time.time() if now is None else now
     snap = _state["snapshot"] if isinstance(_state["snapshot"], dict) else {}
+    # copy, don't replace: medic_cloud also carries the restart rate-limiter
+    # state (last_restart_ts) which must persist across cycles.
+    mc = dict(_state.get("medic_cloud") or {})
     findings = _medic_triage(snap, _state.get("received_at"), now)
     status = _medic_status(findings)
 
@@ -440,14 +455,14 @@ def _medic_cycle(now: float | None = None) -> dict:
         if not hook:
             actions.append("restart needed — env SYNTH_DEPLOY_HOOK not set")
         else:
-            allowed, why = _medic_restart_allowed(_state.get("medic_cloud"), now)
+            allowed, why = _medic_restart_allowed(mc, now)
             if not allowed:
                 actions.append(f"restart skipped — {why}")
             else:
                 ok, http_txt = _post_deploy_hook(hook)
                 if ok:
-                    _state["medic_cloud"] = {"last_restart_ts": now,
-                                             "last_restart_reason": reason_txt}
+                    mc["last_restart_ts"] = now
+                    mc["last_restart_reason"] = reason_txt
                     actions.append(f"worker restart triggered via deploy hook "
                                    f"({http_txt}) — reason: {reason_txt}")
                 else:
@@ -458,8 +473,16 @@ def _medic_cycle(now: float | None = None) -> dict:
 
     report = {"ts": int(now), "status": status, "findings": findings,
               "actions": actions, "diagnosis": "—", "source": "cloud"}
+    # liveness stamp: proves the cloud medic actually ticked, even while the
+    # Mac medic (laptop on) currently owns the shared `medic` display field.
+    mc["last_cycle_ts"] = int(now)
+    mc["last_status"] = status
+    mc["last_findings"] = [str(f.get("code")) for f in findings]
+    _state["medic_cloud"] = mc
     _state["medic"] = report
     _save_state()
+    print(f"[cloud-medic] tick status={status} "
+          f"findings={mc['last_findings']} actions={actions}", flush=True)
     return report
 
 
@@ -745,12 +768,26 @@ _SEV_CLS = {"critical": "neg", "warn": "amb", "info": "mut"}
 _MEDIC_PILL = {"healthy": "pos", "degraded": "amb", "critical": "neg"}
 
 
-def _medic(medic: Any) -> str:
-    """Compact Medic block for the Ops Panel; tolerates any missing field."""
+def _medic(medic: Any, medic_cloud: Any = None) -> str:
+    """Compact Medic block for the Ops Panel; tolerates any missing field.
+
+    The main line shows whichever medic wrote last (Mac reports carry an LLM
+    diagnosis and overwrite the cloud report). The cloud-medic liveness footer
+    is always shown when available, so a silently-dead cloud thread can't hide
+    behind an active Mac medic — this is the laptop-off health signal."""
+    cloud_html = ""
+    cts = _num(medic_cloud.get("last_cycle_ts")) if isinstance(medic_cloud, dict) else None
+    if cts:
+        cstatus = str(medic_cloud.get("last_status") or "unknown").lower()
+        cpill = _MEDIC_PILL.get(cstatus, "mut")
+        cloud_html = (
+            "<div class='mut' style='font-size:11px;margin-top:6px'>"
+            f"cloud medic (24/7): <span class='pill {cpill}'>{esc(cstatus)}</span> "
+            f"· last tick {_fmt_ts(cts)} · {_age(time.time() - cts)} ago</div>")
     if not isinstance(medic, dict) or not medic:
         return ('<div class="panel mut" style="margin-top:10px">'
                 "Medic: no report yet — the built-in cloud medic checks every "
-                "15 minutes.</div>")
+                "15 minutes." + cloud_html + "</div>")
     status = str(medic.get("status") or "unknown").lower()
     pill = _MEDIC_PILL.get(status, "mut")
     source = str(medic.get("source") or "mac").lower()
@@ -782,11 +819,12 @@ def _medic(medic: Any) -> str:
         '<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">'
         f'<b>Medic</b><span class="pill {pill}">{esc(status)}</span>'
         f'<span class="mut" style="font-size:11px">{esc(checked)}</span></div>'
-        f'<div style="margin-top:8px">{findings_html}</div>{action_html}{diag_html}</div>'
+        f'<div style="margin-top:8px">{findings_html}</div>{action_html}{diag_html}{cloud_html}</div>'
     )
 
 
-def _ops(snap: dict, received_at: float | None, medic: Any = None) -> str:
+def _ops(snap: dict, received_at: float | None, medic: Any = None,
+         medic_cloud: Any = None) -> str:
     rows: list[tuple[str, str, str]] = []
 
     expires = str(snap.get("token_expires") or "")
@@ -826,7 +864,8 @@ def _ops(snap: dict, received_at: float | None, medic: Any = None) -> str:
     body = "".join(
         f"<tr><td class='mut'>{k}</td><td class='{cls}'>{v}</td></tr>" for k, v, cls in rows
     )
-    return f'<div class="panel scroll"><table class="ops">{body}</table></div>' + _medic(medic)
+    return (f'<div class="panel scroll"><table class="ops">{body}</table></div>'
+            + _medic(medic, medic_cloud))
 
 
 _CSS = """
@@ -886,7 +925,8 @@ def index() -> Response:
         + "<h2>Lessons Learned</h2>" + _lessons(snap)
         + "<h2>Coach's Daily Brief</h2>" + _coach(_state.get("coach"))
         + "<h2>Strategy Scorecard</h2>" + _scorecard(snap)
-        + "<h2>Ops Panel</h2>" + _ops(snap, received_at, _state.get("medic"))
+        + "<h2>Ops Panel</h2>" + _ops(snap, received_at, _state.get("medic"),
+                                      _state.get("medic_cloud"))
         + "<footer>synthetic-trader dashboard · state is pushed by the bot's Mac · refresh for latest</footer>"
         "</body></html>"
     )

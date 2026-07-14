@@ -85,6 +85,13 @@ def _pnl_cls(v: float | None) -> str:
     return "pos" if v > 0 else "neg" if v < 0 else "mut"
 
 
+def _veto_counts(snap: dict) -> tuple[int, int]:
+    """(vetoed, total) symbols in the analyst bias map; (0, 0) if absent."""
+    analyst = snap.get("analyst") if isinstance(snap.get("analyst"), dict) else {}
+    bias = analyst.get("bias") if isinstance(analyst.get("bias"), dict) else {}
+    return sum(1 for b in bias.values() if str(b).lower() == "veto"), len(bias)
+
+
 def _authed() -> bool:
     """Constant-time Bearer check against SYNC_TOKEN (shared by all API routes)."""
     token = os.environ.get("SYNC_TOKEN", "")
@@ -190,14 +197,18 @@ def _hero(snap: dict, received_at: float | None) -> str:
     pnl = equity - start if equity is not None and start is not None else None
     pnl_pct = pnl / start * 100 if pnl is not None and start else None
 
-    banners = []
+    banners = []  # (text, css class) — red for faults, amber for by-design pauses
     if received_at is None:
-        banners.append("NO DATA YET — waiting for the first push from the bot")
+        banners.append(("NO DATA YET — waiting for the first push from the bot", "banner"))
     elif time.time() - received_at > OFFLINE_AFTER_S:
-        banners.append(f"BOT OFFLINE? last sync {_age(time.time() - received_at)} ago")
+        banners.append((f"BOT OFFLINE? last sync {_age(time.time() - received_at)} ago", "banner"))
     if risk.get("kill_switch"):
-        banners.append("KILL SWITCH ACTIVE — entries halted")
-    banner_html = "".join(f'<div class="banner">{esc(b)}</div>' for b in banners)
+        banners.append(("KILL SWITCH ACTIVE — entries halted", "banner"))
+    veto_n, bias_n = _veto_counts(snap)
+    if bias_n and veto_n * 2 >= bias_n:
+        banners.append((f"MACRO FILTER PAUSE — analyst has vetoed {veto_n}/{bias_n} markets; "
+                        "entries suspended by design", "banner amb"))
+    banner_html = "".join(f'<div class="{cls}">{esc(b)}</div>' for b, cls in banners)
 
     mode = "MICRO" if risk.get("micro") else "NORMAL"
     pnl_txt = _usd(pnl, signed=True) + (f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else "")
@@ -447,12 +458,15 @@ def _ops(snap: dict, received_at: float | None) -> str:
     analyst = snap.get("analyst") if isinstance(snap.get("analyst"), dict) else {}
     fallback = bool(analyst.get("fallback")) or str(analyst.get("notes", "")).lower().startswith("fallback")
     a_age = _age(time.time() - _num(analyst.get("ts"))) if _num(analyst.get("ts")) else "unknown age"
+    veto_n, bias_n = _veto_counts(snap)
+    veto_txt = f" · {veto_n}/{bias_n} markets vetoed" if bias_n else ""
     if not analyst:
         rows.append(("Analyst", "no analyst data in snapshot", "mut"))
     elif fallback:
         rows.append(("Analyst", f"NEUTRAL FALLBACK ({a_age}) — Claude offline on the bot Mac; run `claude` + /login", "amb"))
     else:
-        rows.append(("Analyst", f"active, view refreshed {a_age} ago", "pos"))
+        rows.append(("Analyst", f"active, view refreshed {a_age} ago{veto_txt}",
+                     "amb" if bias_n and veto_n * 2 >= bias_n else "pos"))
 
     sync_age = time.time() - received_at if received_at is not None else None
     rows.append(("Last sync", f"{_age(sync_age)}" + (" ago" if sync_age is not None else ""),
@@ -478,6 +492,7 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--cyan
 .chip{font-size:12px;color:var(--mut)}
 .banner{background:#3a1114;border:1px solid var(--red);color:#ffd9d9;padding:12px 16px;
 border-radius:10px;font-weight:700;margin:14px 0;letter-spacing:.03em}
+.banner.amb{background:#332508;border-color:var(--amb);color:#ffe8b0}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}
 .tile{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:12px 14px}
 .tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--mut)}

@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -157,8 +158,12 @@ def push():
     _state["snapshot"] = snap
     _state["received_at"] = time.time()
     pushed = snap.get("equity_series")
-    if isinstance(pushed, list) and pushed:  # optional full-series override
-        series = []
+    if isinstance(pushed, list) and pushed:
+        # MERGE with the stored series (union by timestamp) instead of
+        # replacing it: the cloud worker's journal is ephemeral, so its first
+        # push after a restart carries only a couple of points — a straight
+        # replace wiped the whole chart history (2026-07-16 incident).
+        merged = {p[0]: p[1] for p in _state["series"]}
         for p in pushed:
             if isinstance(p, (list, tuple)) and len(p) >= 2:
                 ts, eq = _num(p[0], 0.0), _num(p[1])
@@ -167,8 +172,8 @@ def push():
             else:
                 continue
             if eq is not None:
-                series.append([ts, eq])
-        _state["series"] = series[-MAX_SERIES:]
+                merged[ts] = eq
+        _state["series"] = [[t, merged[t]] for t in sorted(merged)][-MAX_SERIES:]
     else:
         eq = _num(snap.get("equity"))
         ts = _num(snap.get("ts")) or _state["received_at"]
@@ -492,7 +497,9 @@ def _medic_loop() -> None:
         try:
             _medic_cycle()
         except Exception:
-            pass  # never let the medic thread die
+            # never die — but never hide either: a silently-failing medic is
+            # indistinguishable from a healthy one (learned the hard way)
+            traceback.print_exc()
         time.sleep(MEDIC_INTERVAL_S)
 
 
@@ -934,7 +941,19 @@ def index() -> Response:
 
 
 _load_state()
-_start_medic_thread()  # cloud medic runs 24/7 inside this service
+# Start the medic lazily on the first request, NOT at import time: under
+# `gunicorn --preload` the module imports in the MASTER process, so a thread
+# started here would live in the master — whose _state never receives pushes
+# (those go to forked workers). That medic saw DASH_AMNESIA forever and the
+# workers served a frozen medic_cloud (the 2-day-blind-medic incident,
+# 2026-07-16). before_request runs in the serving worker, so the thread
+# shares the _state that pushes actually mutate. _start_medic_thread is
+# lock-guarded and idempotent, so the per-request call is a cheap no-op after
+# the first. (With -w >1 each worker gets its own medic thread; restart
+# cooldown is per-process — run this service with a single worker.)
+@app.before_request
+def _ensure_medic_thread() -> None:
+    _start_medic_thread()
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5077")))

@@ -546,10 +546,15 @@ def _hero(snap: dict, received_at: float | None) -> str:
 
     mode = "MICRO" if risk.get("micro") else "NORMAL"
     pnl_txt = _usd(pnl, signed=True) + (f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else "")
+    day_abs, day_pct = _today_pnl(_state["series"], equity)
+    day_txt = (_usd(day_abs, signed=True) + (f" ({day_pct:+.2f}%)" if day_pct is not None else "")
+               if day_abs is not None else "—")
+    spark = _sparkline(_state["series"])
     tiles = [
-        ("Equity", _usd(equity), "cy"),
-        ("Balance", _usd(balance), ""),
+        ("Equity", _usd(equity) + spark, "cy"),
+        ("Today", esc(day_txt), _pnl_cls(day_abs)),
         ("P&amp;L vs start", esc(pnl_txt) if pnl is not None else "—", _pnl_cls(pnl)),
+        ("Balance", _usd(balance), ""),
         ("Open positions", str(len(positions)), ""),
         ("Mode", mode, "amb" if mode == "MICRO" else "pos"),
     ]
@@ -875,6 +880,159 @@ def _ops(snap: dict, received_at: float | None, medic: Any = None,
             + _medic(medic, medic_cloud))
 
 
+def _today_pnl(series: list, equity: float | None) -> tuple[float | None, float | None]:
+    """(abs, pct) equity change since the first point of the current UTC day.
+
+    Uses the pushed equity series, so it survives worker restarts. Returns
+    (None, None) when the day has no earlier reference point."""
+    if equity is None or not series:
+        return None, None
+    midnight = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
+    today = [p for p in series if _num(p[0], 0.0) >= midnight]
+    ref = today[0][1] if today else None
+    if ref is None:
+        prior = [p for p in series if _num(p[0], 0.0) < midnight]
+        ref = prior[-1][1] if prior else None
+    ref = _num(ref)
+    if ref is None or ref == 0:
+        return None, None
+    return equity - ref, (equity - ref) / ref * 100
+
+
+def _sparkline(series: list, w: int = 150, h: int = 34) -> str:
+    """Tiny inline equity sparkline for the hero tile."""
+    pts = [(_num(p[0], 0.0), _num(p[1])) for p in series if _num(p[1]) is not None][-120:]
+    if len(pts) < 2:
+        return ""
+    ys = [p[1] for p in pts]
+    lo, hi = min(ys), max(ys)
+    span = (hi - lo) or 1.0
+    step = w / (len(pts) - 1)
+    path = " ".join(f"{i*step:.1f},{h - (y-lo)/span*(h-4) - 2:.1f}" for i, (_, y) in enumerate(pts))
+    cls = "pos" if ys[-1] >= ys[0] else "neg"
+    return (f"<svg class='spark {cls}' viewBox='0 0 {w} {h}' preserveAspectRatio='none'>"
+            f"<polyline points='{path}' fill='none' stroke='currentColor' stroke-width='1.6'/></svg>")
+
+
+# ---- signal funnel: where did each signal die? -----------------------------
+# The engine's own vocabulary: strategies propose -> analyst filter -> risk
+# gate -> sizing -> broker. Each stage logs a distinct verb, so the decision
+# log is a complete census of every signal that reached the gate.
+_FUNNEL_STAGES = (
+    ("executed", "Executed", "pos"),
+    ("analyst", "Blocked — analyst bias/veto", "amb"),
+    ("risk", "Blocked — risk gate", "amb"),
+    ("size", "Skipped — no compliant size", "amb"),
+    ("rejected", "Rejected by broker", "neg"),
+)
+
+
+def _funnel_counts(snap: dict) -> dict[str, int]:
+    counts = {k: 0 for k, _, _ in _FUNNEL_STAGES}
+    for line in _medic_run_lines(snap):
+        low = line.lower()
+        if "opened" in low:
+            counts["executed"] += 1
+        elif "rejected" in low:
+            counts["rejected"] += 1
+        elif "skipped" in low:
+            counts["size"] += 1
+        elif "blocked" in low:
+            if "analyst" in low or "veto" in low:
+                counts["analyst"] += 1
+            else:
+                counts["risk"] += 1
+    return counts
+
+
+def _funnel(snap: dict) -> str:
+    counts = _funnel_counts(snap)
+    total = sum(counts.values())
+    if not total:
+        return ("<div class='panel mut'>No signals have reached the risk gate in this run yet. "
+                "Strategies only fire on a NEW closed candle — D1 modules evaluate once per day.</div>")
+    rows = []
+    for key, label, cls in _FUNNEL_STAGES:
+        n = counts[key]
+        pct = n / total * 100
+        rows.append(
+            f"<div class='fstage'><div class='flabel'>{esc(label)}"
+            f"<b class='{cls}'>{n}</b></div>"
+            f"<div class='fbar'><i class='{cls}' style='width:{pct:.1f}%'></i></div></div>")
+    passed = counts["executed"]
+    note = (f"{total} signal{'s' if total != 1 else ''} reached the risk gate this run · "
+            f"{passed} became live trade{'s' if passed != 1 else ''}")
+    return (f"<div class='panel'>{''.join(rows)}"
+            f"<div class='mut' style='font-size:11.5px;margin-top:9px'>{esc(note)}</div></div>")
+
+
+# ---- analyst bias grid ----------------------------------------------------
+_BIAS_CLS = {"long": "pos", "short": "neg", "veto": "veto", "neutral": "mut"}
+
+
+def _bias_grid(snap: dict) -> str:
+    a = snap.get("analyst") if isinstance(snap.get("analyst"), dict) else {}
+    bias = a.get("bias") if isinstance(a.get("bias"), dict) else {}
+    if not bias:
+        return "<div class='panel mut'>No analyst view yet.</div>"
+    cells = "".join(
+        f"<div class='bcell {_BIAS_CLS.get(str(v).lower(), 'mut')}'>"
+        f"<span class='bsym'>{esc(k)}</span><span class='bval'>{esc(str(v)[:5])}</span></div>"
+        for k, v in sorted(bias.items()))
+    notes = str(a.get("notes") or "")
+    stale = " · statistical fallback (Claude unreachable)" if a.get("fallback") else ""
+    return (f"<div class='panel'><div class='bgrid'>{cells}</div>"
+            + (f"<div class='mut' style='font-size:11.5px;margin-top:10px'>{esc(notes[:400])}"
+               f"{esc(stale)}</div>" if notes else "") + "</div>")
+
+
+# ---- outcome distribution -------------------------------------------------
+def _distribution(snap: dict) -> str:
+    """Histogram of realized P&L per closed trade — the honest version of a
+    payoff distribution: no modelled curve, just what actually happened."""
+    pnls = [_num(t.get("pnl_usd")) for t in _rows(snap.get("trades"))]
+    pnls = [p for p in pnls if p is not None]
+    if not pnls:
+        return "<div class='panel mut'>No closed trades yet.</div>"
+    lo, hi = min(pnls), max(pnls)
+    span = (hi - lo) or 1.0
+    nb = 9
+    buckets = [0] * nb
+    for p in pnls:
+        i = min(nb - 1, int((p - lo) / span * nb))
+        buckets[i] += 1
+    peak = max(buckets) or 1
+    bars = "".join(
+        f"<div class='dcol'><i class='{'pos' if lo + (i+0.5)*span/nb >= 0 else 'neg'}' "
+        f"style='height:{b/peak*100:.0f}%'></i>"
+        f"<span class='dn'>{b or ''}</span></div>" for i, b in enumerate(buckets))
+    wins = sum(1 for p in pnls if p > 0)
+    gross_w = sum(p for p in pnls if p > 0)
+    gross_l = -sum(p for p in pnls if p <= 0)
+    pf = (gross_w / gross_l) if gross_l else float("inf")
+    stats = (f"n={len(pnls)} · win rate {wins/len(pnls)*100:.0f}% · "
+             f"PF {pf:.2f} · avg {_usd(sum(pnls)/len(pnls), signed=True)} · "
+             f"best {_usd(hi, signed=True)} · worst {_usd(lo, signed=True)}")
+    return (f"<div class='panel'><div class='dist'>{bars}</div>"
+            f"<div class='axis'><span>{_usd(lo, signed=True)}</span>"
+            f"<span class='mut'>realized P&amp;L per trade</span>"
+            f"<span>{_usd(hi, signed=True)}</span></div>"
+            f"<div class='mut' style='font-size:11.5px;margin-top:8px'>{esc(stats)}</div></div>")
+
+
+# ---- live tape ------------------------------------------------------------
+def _tape(snap: dict) -> str:
+    """Newest-first activity feed — the trading equivalent of a log tail."""
+    lines = [d for d in _rows(snap.get("decisions")) if not d.get("stale")][-40:]
+    if not lines:
+        return "<div class='panel mut'>No activity in the current run yet.</div>"
+    items = "".join(
+        f"<li class='{_decision_cls(str(d.get('text','')))}'>{esc(str(d.get('text',''))[:200])}</li>"
+        for d in reversed(lines))
+    return f"<div class='panel scroll'><ul class='tape'>{items}</ul></div>"
+
+
 _CSS = """
 :root{--bg:#0b0e14;--panel:#121722;--edge:#1e2634;--txt:#d9dee9;--mut:#8b93a7;
 --cyan:#22d3ee;--grn:#34d399;--red:#f87171;--amb:#fbbf24}
@@ -912,29 +1070,184 @@ font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid c
 .pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}.amb{color:var(--amb)}.cy{color:var(--cyan)}
 ul.log li.stale{opacity:.42;font-style:italic}
 footer{color:var(--mut);font-size:11px;margin:26px 0 8px;text-align:center}
+/* --- live status bar --- */
+.statusbar{display:flex;flex-wrap:wrap;gap:7px 16px;align-items:center;background:var(--panel);
+border:1px solid var(--edge);border-radius:10px;padding:9px 13px;margin-top:12px;font-size:11.5px;
+color:var(--mut);font-variant-numeric:tabular-nums}
+.statusbar b{color:var(--txt);font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block;
+margin-right:6px;box-shadow:0 0 0 0 rgba(52,211,153,.7);animation:pulse 2.4s infinite}
+.dot.stale{background:var(--amb);animation:none}.dot.dead{background:var(--red);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.6)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}
+100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+.tile .v svg.spark{display:block;width:100%;height:30px;margin-top:5px}
+/* --- signal funnel --- */
+.fstage{margin:9px 0}
+.flabel{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);margin-bottom:4px}
+.flabel b{font-variant-numeric:tabular-nums}
+.fbar{height:8px;background:#0c1018;border-radius:99px;overflow:hidden}
+.fbar i{display:block;height:100%;background:currentColor;border-radius:99px;
+transition:width .6s cubic-bezier(.4,0,.2,1)}
+/* --- analyst bias grid --- */
+.bgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(92px,1fr));gap:7px}
+.bcell{border:1px solid var(--edge);border-radius:8px;padding:7px 8px;background:#0c1018;
+display:flex;flex-direction:column;gap:2px}
+.bcell.pos{border-color:rgba(52,211,153,.55)}.bcell.neg{border-color:rgba(248,113,113,.55)}
+.bcell.veto{border-color:var(--amb);background:#241a05}
+.bsym{font-size:11px;color:var(--txt);letter-spacing:.04em}
+.bval{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:700}
+.bcell.pos .bval{color:var(--grn)}.bcell.neg .bval{color:var(--red)}
+.bcell.veto .bval{color:var(--amb)}.bcell.mut .bval{color:var(--mut)}
+/* --- outcome distribution --- */
+.dist{display:flex;align-items:flex-end;gap:4px;height:110px}
+.dcol{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%}
+.dcol i{display:block;width:100%;background:currentColor;border-radius:3px 3px 0 0;min-height:2px;
+transition:height .6s cubic-bezier(.4,0,.2,1)}
+.dcol .dn{font-size:10px;color:var(--mut);margin-top:3px;height:12px}
+/* --- live tape --- */
+ul.tape{list-style:none;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+max-height:290px;overflow-y:auto}
+ul.tape li{padding:2px 0;border-bottom:1px solid rgba(30,38,52,.55);white-space:nowrap}
+ul.tape li:last-child{border-bottom:none}
+.upd{animation:flash .9s ease-out}
+@keyframes flash{0%{background:rgba(34,211,238,.13)}100%{background:transparent}}
+@media(max-width:560px){.dist{height:84px}ul.tape{max-height:220px}}
 """
+
+_JS = """
+const POLL_MS = 10000;
+let lastTs = 0;
+function agoTxt(s){ s=Math.max(0,Math.round(s));
+  if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m '+(s%60)+'s';
+  if(s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+  return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h'; }
+// live-ticking counters: update every second WITHOUT hitting the server
+function tick(){
+  document.querySelectorAll('[data-since]').forEach(el=>{
+    const t=parseFloat(el.dataset.since); if(!t) return;
+    el.textContent = agoTxt(Date.now()/1000 - t) + ' ago';
+  });
+  const d=document.getElementById('livedot'), sy=parseFloat(d?.dataset.sync||0);
+  if(d&&sy){ const a=Date.now()/1000-sy;
+    d.className='dot'+(a>600?' dead':a>240?' stale':''); }
+}
+async function refresh(){
+  try{
+    const r = await fetch('/api/view',{cache:'no-store'});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(j.ts === lastTs) return;          // nothing new — leave the DOM alone
+    lastTs = j.ts;
+    for(const [id, html] of Object.entries(j.sections)){
+      const el = document.getElementById(id);
+      if(el && el.innerHTML !== html){
+        el.innerHTML = html;
+        el.classList.remove('upd'); void el.offsetWidth; el.classList.add('upd');
+      }
+    }
+    tick();
+  }catch(e){ /* transient network blip: keep the last good view */ }
+}
+setInterval(tick, 1000);
+setInterval(refresh, POLL_MS);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) refresh(); });
+tick();
+"""
+
+
+def _statusbar(snap: dict, received_at: float | None) -> str:
+    """Dense always-on vitals strip. Timestamps are emitted as epoch seconds in
+    data-since so the browser ticks them every second without polling."""
+    mc = _state.get("medic_cloud") or {}
+    a = snap.get("analyst") if isinstance(snap.get("analyst"), dict) else {}
+    h = snap.get("health") if isinstance(snap.get("health"), dict) else {}
+    bits = [f"<span><i class='dot' id='livedot' data-sync='{received_at or 0}'></i>"
+            f"<b>{'LIVE' if received_at else 'NO DATA'}</b></span>"]
+    if received_at:
+        bits.append(f"sync <b data-since='{received_at:.0f}'>—</b>")
+    if h.get("run_started"):
+        bits.append(f"run since <b>{esc(h.get('run_started'))}</b>")
+    errs = int(_num(h.get("errors_current_run"), 0) or 0)
+    bits.append(f"errors <b class='{'neg' if errs else 'pos'}'>{errs}</b>")
+    if _num(a.get("ts")):
+        bits.append(f"analyst <b data-since='{_num(a.get('ts')):.0f}'>—</b>")
+    if _num(mc.get("last_cycle_ts")):
+        bits.append(f"medic <b class='{_MEDIC_PILL.get(str(mc.get('last_status')), 'mut')}'>"
+                    f"{esc(str(mc.get('last_status') or '?'))}</b> "
+                    f"<b data-since='{_num(mc.get('last_cycle_ts')):.0f}'>—</b>")
+    exp = snap.get("token_expires")
+    if exp:
+        try:
+            days = (datetime.fromisoformat(str(exp)).replace(tzinfo=timezone.utc)
+                    - datetime.now(timezone.utc)).days
+            bits.append(f"token <b class='{'neg' if days < 3 else 'amb' if days < 7 else 'pos'}'>"
+                        f"{days}d</b>")
+        except ValueError:
+            pass
+    return f"<div class='statusbar'>{' '.join(bits)}</div>"
+
+
+def _sections(snap: dict, received_at: float | None) -> dict[str, str]:
+    """Every live-updating region, keyed by DOM id. The poller swaps these in
+    place, so server-side rendering stays the single source of truth."""
+    return {
+        "s-status": _statusbar(snap, received_at),
+        "s-hero": _hero(snap, received_at),
+        "s-chart": _equity_chart(_state["series"]),
+        "s-funnel": _funnel(snap),
+        "s-bias": _bias_grid(snap),
+        "s-tape": _tape(snap),
+        "s-dist": _distribution(snap),
+        "s-decisions": _decisions(snap),
+        "s-lessons": _lessons(snap),
+        "s-coach": _coach(_state.get("coach")),
+        "s-scorecard": _scorecard(snap),
+        "s-ops": _ops(snap, received_at, _state.get("medic"), _state.get("medic_cloud")),
+    }
+
+
+@app.get("/api/view")
+def api_view():
+    """Rendered sections for the auto-refreshing page. Public on purpose: it
+    carries exactly what "/" already shows and no secrets."""
+    snap = _state["snapshot"] if isinstance(_state["snapshot"], dict) else {}
+    return jsonify(ts=_num(_state.get("received_at"), 0),
+                   sections=_sections(snap, _state["received_at"]))
+
+
+_LAYOUT = (
+    ("s-hero", None), ("s-chart", "Equity Chart"),
+    ("s-funnel", "Signal Funnel — where signals die"),
+    ("s-bias", "Analyst Regime Map"),
+    ("s-tape", "Live Tape"),
+    ("s-dist", "Outcome Distribution"),
+    ("s-decisions", "Decisions"), ("s-lessons", "Lessons Learned"),
+    ("s-coach", "Coach's Daily Brief"), ("s-scorecard", "Strategy Scorecard"),
+    ("s-ops", "Ops Panel"),
+)
 
 
 @app.get("/")
 def index() -> Response:
     snap = _state["snapshot"] if isinstance(_state["snapshot"], dict) else {}
     received_at = _state["received_at"]
+    sec = _sections(snap, received_at)
+    body = "".join(
+        (f"<h2>{esc(title)}</h2>" if title else "")
+        + f"<div id='{sid}'>{sec[sid]}</div>"
+        for sid, title in _LAYOUT
+    )
     page = (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>Synthetic Trader</title>"
         f"<style>{_CSS}</style></head><body>"
         "<header><h1>SYNTHETIC <b>TRADER</b></h1>"
-        f"<span class='chip'>snapshot ts {_fmt_ts(snap.get('ts'))} · rendered {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</span></header>"
-        + _hero(snap, received_at)
-        + "<h2>Equity Chart</h2>" + _equity_chart(_state["series"])
-        + "<h2>Decisions</h2>" + _decisions(snap)
-        + "<h2>Lessons Learned</h2>" + _lessons(snap)
-        + "<h2>Coach's Daily Brief</h2>" + _coach(_state.get("coach"))
-        + "<h2>Strategy Scorecard</h2>" + _scorecard(snap)
-        + "<h2>Ops Panel</h2>" + _ops(snap, received_at, _state.get("medic"),
-                                      _state.get("medic_cloud"))
-        + "<footer>synthetic-trader dashboard · state is pushed by the bot's Mac · refresh for latest</footer>"
+        f"<span class='chip'>snapshot {_fmt_ts(snap.get('ts'))} · live · auto-refreshing</span></header>"
+        f"<div id='s-status'>{sec['s-status']}</div>"
+        + body
+        + "<footer>synthetic-trader · pushed by the cloud worker · this page updates itself</footer>"
+        f"<script>{_JS}</script>"
         "</body></html>"
     )
     return Response(page, mimetype="text/html")

@@ -550,12 +550,19 @@ def _hero(snap: dict, received_at: float | None) -> str:
     day_txt = (_usd(day_abs, signed=True) + (f" ({day_pct:+.2f}%)" if day_pct is not None else "")
                if day_abs is not None else "—")
     spark = _sparkline(_state["series"])
+    # equity-balance is authoritative for open exposure even when the position
+    # mirror is stale, so a live trade can never render as "0 open positions"
+    unreal = (equity - balance) if (equity is not None and balance is not None) else None
+    open_txt = str(len(positions)) if positions else (
+        "1+" if unreal is not None and abs(unreal) >= 0.01 else "0")
     tiles = [
         ("Equity", _usd(equity) + spark, "cy"),
         ("Today", esc(day_txt), _pnl_cls(day_abs)),
         ("P&amp;L vs start", esc(pnl_txt) if pnl is not None else "—", _pnl_cls(pnl)),
+        ("Unrealized", _usd(unreal, signed=True) if unreal is not None else "—",
+         _pnl_cls(unreal)),
         ("Balance", _usd(balance), ""),
-        ("Open positions", str(len(positions)), ""),
+        ("Open positions", open_txt, ""),
         ("Mode", mode, "amb" if mode == "MICRO" else "pos"),
     ]
     tiles_html = "".join(
